@@ -339,28 +339,16 @@ class SurgeFactor:
     
     def _identify_surge_m10_same_time(self, bar_df: pl.DataFrame) -> pl.DataFrame:
         """
-        M10模式 - same_time方法
+        M10模式 - same_time方法（修复版）
         
-        逻辑：
-        1. 对每个(symbol, bar_time)组合
-        2. 用过去H天（不包括当天）同一时刻的数据计算基准
-        3. 判断当天该时刻是否surge
-        
-        实现方式：
-        - 循环每个日期
-        - 为每个日期，用前H天的同一bar_time数据计算基准
-        - 与基准比较，标记surge
-        
-        示例：
-            lookback_days=20, threshold=2.0
-            对于2022-01-21的09:40这个bar，
-            用2022-01-01~20的所有09:40 bar计算基准mean和std，
-            判断该bar是否 > mean + 2.0*std
-        
-        Returns:
-            添加了is_surge列的DataFrame
+        修复：使用 bar_time 的时间部分进行匹配，而不是完整的 datetime
         """
         print(f"🔍 M10 Surge识别 (same_time): H={self.lookback_days}天, threshold={self.threshold}")
+        
+        # 添加 bar_time_only 列（只保留时间部分）
+        bar_df = bar_df.with_columns(
+            pl.col("bar_time").dt.time().alias("bar_time_only")
+        )
         
         # 获取所有日期，排序
         dates = sorted(bar_df["date"].unique().to_list())
@@ -368,13 +356,11 @@ class SurgeFactor:
         result_list = []
         
         for target_date in dates:
-            # 找到该日期在列表中的位置
             date_idx = dates.index(target_date)
             
             # 前H天的日期（不包括当天）
             lookback_dates = dates[max(0, date_idx - self.lookback_days):date_idx]
             
-            # 如果历史数据不足，跳过或警告
             if len(lookback_dates) < self.lookback_days:
                 print(f"  ⚠️  {target_date}: 历史数据不足({len(lookback_dates)}天 < {self.lookback_days}天)，跳过")
                 continue
@@ -382,10 +368,11 @@ class SurgeFactor:
             # 基准数据：过去H天
             baseline_df = bar_df.filter(pl.col("date").is_in(lookback_dates))
             
-            # 计算每个(symbol, bar_time)的基准统计量
+            # 计算每个(symbol, bar_time_only)的基准统计量
+            # 关键修复：使用 bar_time_only 而不是 bar_time
             baseline_stats = (
                 baseline_df
-                .group_by(["symbol", "bar_time"])
+                .group_by(["symbol", "bar_time_only"])
                 .agg([
                     pl.col("vol").mean().alias("vol_mean_baseline"),
                     pl.col("vol").std().alias("vol_std_baseline"),
@@ -395,10 +382,10 @@ class SurgeFactor:
             # 当天数据
             target_df = bar_df.filter(pl.col("date") == target_date)
             
-            # Join基准统计量
+            # Join基准统计量（使用 bar_time_only）
             target_df = target_df.join(
                 baseline_stats,
-                on=["symbol", "bar_time"],
+                on=["symbol", "bar_time_only"],
                 how="left"
             )
             
@@ -417,17 +404,20 @@ class SurgeFactor:
             
             result_list.append(target_df)
         
-        # 合并所有日期
         if not result_list:
             raise ValueError(f"所有日期的历史数据都不足{self.lookback_days}天，无法计算surge")
         
         result_df = pl.concat(result_list)
+        
+        # 删除临时列
+        result_df = result_df.drop("bar_time_only")
         
         surge_ratio = result_df["is_surge"].sum() / len(result_df)
         print(f"  - 有效日期数: {len(result_list)}/{len(dates)}")
         print(f"  - Surge占比: {surge_ratio:.2%}")
         
         return result_df
+            
 
 
     # ============================================================
