@@ -17,7 +17,7 @@ import numpy as np
 from datetime import time, datetime
 from typing import List, Literal, Optional, Union, Dict
 
-from dux.cal import bizdays
+from dux.cal import bizdays,bizday
 
 from data_loader import DataLoader
 from bar_builder import BarBuilder
@@ -200,33 +200,38 @@ class SurgeFactor:
     
     def load_and_build_bars(
         self, 
-        bizdays_str: str,
+        bizdays_str: str = None,
+        date_list: List[str] = None,
         add_intraday_ret: bool = True
     ) -> pl.DataFrame:
         """
         加载trade数据并合成bar
         
         Args:
-            bizdays_str: 交易日范围字符串，格式如 '20220104-10' 表示读取20220104到20220110的数据
-                        会通过bizdays()函数转换为日期列表
-            add_intraday_ret: 是否添加bar收益率列（surge_ret需要）
+            bizdays_str: 交易日范围字符串，格式如 '20220104-10'
+            date_list: 直接传入日期列表（与 bizdays_str 二选一）
+            add_intraday_ret: 是否添加bar收益率列
         
         Returns:
-            bar数据DataFrame，包含列：
-            - symbol, date, bar_time
-            - open, high, low, close, vol, amt, vwap
-            - ret (收盘价收益率，相对前一个bar)
-            - bar_ret (bar内收益率，如果add_intraday_ret=True)
+            bar数据DataFrame
         """
-        print(f"📊 加载数据: {bizdays_str}，频率: {self.bar_freq}")
+        # 确定日期列表
+        if date_list is not None:
+            dates = date_list
+        elif bizdays_str is not None:
+            dates = bizdays(bizdays_str)
+        else:
+            raise ValueError("必须提供 bizdays_str 或 date_list")
         
-        # 1. 加载trade数据（使用bizdays函数转换日期范围）
+        print(f"📊 加载数据: {dates[0]} ~ {dates[-1]}，共 {len(dates)} 天，频率: {self.bar_freq}")
+        
+        # 1. 加载trade数据
         trade_lf = self.loader.load_trade(
-            date_list=bizdays(bizdays_str),
+            date_list=dates,
             columns=["inst_id", "xts", "px", "qty", "amt", "flag"]
         )
         
-        # 2. 合成bar（使用bar_builder）
+        # 2. 合成bar
         bar_df = self.bar_builder.group_by_bar_trade(
             lf=trade_lf,
             time_col="xts",
@@ -241,7 +246,7 @@ class SurgeFactor:
         print(f"  - 股票数: {bar_df['symbol'].n_unique()}")
         print(f"  - 日期范围: {bar_df['date'].min()} ~ {bar_df['date'].max()}")
         
-        # 3. 可选：添加bar内收益率（用于surge_ret）
+        # 3. 添加bar内收益率
         if add_intraday_ret:
             bar_df = self._add_bar_returns(bar_df)
         
@@ -917,3 +922,77 @@ class SurgeFactor:
         factor_name = "_".join(parts)
         
         return factor_name
+
+    def get_lookback_days(self) -> int:
+        """
+        获取该因子需要的回看天数
+        
+        Returns:
+            回看天数（用于确定数据加载范围）
+        """
+        if self.output_freq == "EOD":
+            # EOD 模式只需要当天数据
+            return 0
+        elif self.m10_method == "same_time":
+            # same_time 需要前 lookback_days 天
+            return self.lookback_days
+        else:
+            # rolling 需要前 lookback_bars 根 bar
+            # 每天约 24 根 M10 bar（或 48 根 M5，240 根 M1）
+            bars_per_day = get_bar_count_per_day(self.bar_freq)
+            return (self.lookback_bars // bars_per_day) + 1
+
+    def calculate_single_day(
+        self, 
+        settlement_date: str,
+        bar_data: pl.DataFrame = None
+    ) -> pl.DataFrame:
+        """
+        计算单个结算日的因子
+        
+        Args:
+            settlement_date: 结算日，格式 "YYYYMMDD"
+            bar_data: 已加载的 bar 数据（可选，如果不传则自动加载）
+        
+        Returns:
+            该结算日的因子 DataFrame，只包含 settlement_date 这一天的结果
+        """
+        # 1. 如果没有传入 bar_data，自动加载
+        if bar_data is None:
+            lookback = self.get_lookback_days()
+            
+            # 计算起始日期（往前 lookback 个交易日）
+            start_date = bizday(settlement_date, -lookback) if lookback > 0 else settlement_date
+            
+            # 获取日期范围
+            date_list = bizdays(f"{start_date}-{settlement_date}")
+            
+            # 加载数据
+            bar_data = self.load_and_build_bars(date_list=date_list, add_intraday_ret=True)
+        
+        self.bar_data = bar_data
+        
+        # 2. 识别 surge
+        surge_df = self._identify_surge(bar_data)
+        
+        # 3. 聚合因子
+        factor_df = self._aggregate_factor(surge_df)
+        
+        # 4. 只保留结算日的结果（处理类型匹配）
+        # 将 settlement_date 转换为与 date 列相同的类型
+        date_col_dtype = factor_df["date"].dtype
+        if date_col_dtype == pl.Utf8:
+            filter_value = settlement_date
+        else:
+            # 如果是整数类型，转换 settlement_date
+            filter_value = int(settlement_date)
+        
+        factor_df = factor_df.filter(pl.col("date") == filter_value)
+        
+        # 5. 添加因子名称
+        factor_name = self._generate_factor_name()
+        factor_df = factor_df.with_columns(
+            pl.lit(factor_name).alias("factor_name")
+        )
+        
+        return factor_df
