@@ -121,13 +121,11 @@ class SurgeFactor:
         lookback_days: int = 20,
         lookback_bars: int = 48,
         
-        # ===== HF37风格的统计参数（可选）=====
+        # ===== 聚合统计量 =====
         intraday_stat: str = "mean",
-        is_abs: bool = False,
-        neutralize: bool = True,
-        price_type: str = None,
         
-        # ===== 数据路径 =====
+        # ===== 其他参数 =====
+        price_type: str = None,
         data_path: str = None,
     ):
         # 转换 "1m" -> "M1", "5m" -> "M5", "10m" -> "M10"
@@ -150,10 +148,10 @@ class SurgeFactor:
         self.lookback_days = lookback_days
         self.lookback_bars = lookback_bars
         
-        # HF37参数
+        # 聚合统计量
         self.intraday_stat = intraday_stat
-        self.is_abs = is_abs
-        self.neutralize = neutralize
+        
+        # 其他参数
         self.price_type = price_type
         
         # 初始化loader和builder
@@ -189,6 +187,7 @@ class SurgeFactor:
         print(f"  - 输出模式: {self.output_freq}")
         print(f"  - Bar频率: {self.bar_freq}")
         print(f"  - 因子类型: {self.factor_type}")
+        print(f"  - 聚合统计量: {self.intraday_stat}")
         if self.output_freq == "EOD":
             print(f"  - 交易时段: {self.trading_time}")
         else:
@@ -456,7 +455,7 @@ class SurgeFactor:
         2. 筛选完之后，再映射到M10时间点进行聚合
         3. EOD模式：聚合到每天一个值，bar_time设为15:00:00.000
         """
-        print(f"📊 聚合surge_ret因子: {self.intraday_stat}, neutralize={self.neutralize}, is_abs={self.is_abs}")
+        print(f"📊 聚合surge_ret因子: intraday_stat={self.intraday_stat}")
         
         # Step 1: 筛选surge时刻（此时还是原始的1m/5m/10m bar）
         surge_moments = surge_df.filter(pl.col("is_surge") == True)
@@ -470,7 +469,7 @@ class SurgeFactor:
         if self.output_freq == "EOD":
             # EOD: 按(symbol, date)聚合，不需要m10映射
             group_cols = ["symbol", "date"]
-            agg_expr = pl.col("bar_ret").__getattribute__(self.intraday_stat)().alias("individual_stat")
+            agg_expr = pl.col("bar_ret").__getattribute__(self.intraday_stat)().alias("factor_value")
             
             factor_df = (
                 surge_moments
@@ -485,7 +484,7 @@ class SurgeFactor:
             print(f"  - 映射到M10时间点后进行聚合")
             
             group_cols = ["symbol", "date", "m10_bar_time"]
-            agg_expr = pl.col("bar_ret").__getattribute__(self.intraday_stat)().alias("individual_stat")
+            agg_expr = pl.col("bar_ret").__getattribute__(self.intraday_stat)().alias("factor_value")
             
             factor_df = (
                 surge_moments
@@ -495,25 +494,10 @@ class SurgeFactor:
             
             # 重命名为bar_time（保持输出格式一致）
             factor_df = factor_df.rename({"m10_bar_time": "bar_time"})
-            group_cols = ["symbol", "date", "bar_time"]
         
         print(f"  - 聚合后记录数: {len(factor_df)}")
         
-        # Step 3: 截面中性化
-        if self.neutralize:
-            factor_df = self._cross_sectional_neutralize(factor_df, group_cols)
-        else:
-            factor_df = factor_df.with_columns(
-                pl.col("individual_stat").alias("factor_value")
-            )
-        
-        # Step 4: 可选取绝对值
-        if self.is_abs:
-            factor_df = factor_df.with_columns(
-                pl.col("factor_value").abs().alias("factor_value")
-            )
-        
-        # Step 5: EOD模式添加标准的bar_time (15:00:00.000)
+        # Step 3: EOD模式添加标准的bar_time (15:00:00.000)
         if self.output_freq == "EOD":
             factor_df = self._add_eod_bar_time(factor_df)
         
@@ -543,24 +527,6 @@ class SurgeFactor:
         return factor_df.with_columns(
             pl.Series("bar_time", bar_times).cast(pl.Datetime)
         )
-    
-    def _cross_sectional_neutralize(
-        self, 
-        factor_df: pl.DataFrame,
-        group_cols: List[str]
-    ) -> pl.DataFrame:
-        """截面中性化"""
-        cross_sec_group = [col for col in group_cols if col != "symbol"]
-        
-        factor_df = factor_df.with_columns(
-            pl.col("individual_stat").mean().over(cross_sec_group).alias("cross_sec_mean")
-        )
-        
-        factor_df = factor_df.with_columns(
-            (pl.col("individual_stat") - pl.col("cross_sec_mean")).alias("factor_value")
-        )
-        
-        return factor_df
 
     # ============================================================
     # 因子聚合部分 - surge_vol (保持原有逻辑，添加EOD bar_time)
@@ -568,7 +534,7 @@ class SurgeFactor:
     
     def _aggregate_surge_vol(self, surge_df: pl.DataFrame) -> pl.DataFrame:
         """聚合surge_vol因子"""
-        print(f"📊 聚合surge_vol因子: window={self.surge_window}, {self.intraday_stat}")
+        print(f"📊 聚合surge_vol因子: window={self.surge_window}, intraday_stat={self.intraday_stat}")
         
         surge_df = surge_df.with_columns(
             pl.col("is_surge").alias("is_surge_start")
@@ -587,7 +553,7 @@ class SurgeFactor:
         
         print(f"  - Surge period数: {len(period_vol_df)}")
         
-        agg_expr = pl.col("period_vol").__getattribute__(self.intraday_stat)().alias("individual_stat")
+        agg_expr = pl.col("period_vol").__getattribute__(self.intraday_stat)().alias("factor_value")
         
         factor_df = (
             period_vol_df
@@ -597,19 +563,7 @@ class SurgeFactor:
         
         print(f"  - 聚合后记录数: {len(factor_df)}")
         
-        if self.neutralize:
-            factor_df = self._cross_sectional_neutralize(factor_df, ["symbol", "date"])
-        else:
-            factor_df = factor_df.with_columns(
-                pl.col("individual_stat").alias("factor_value")
-            )
-        
-        if self.is_abs:
-            factor_df = factor_df.with_columns(
-                pl.col("factor_value").abs().alias("factor_value")
-            )
-        
-        # 【修复】添加标准的bar_time (15:00:00.000)
+        # 添加标准的bar_time (15:00:00.000)
         factor_df = self._add_eod_bar_time(factor_df)
         
         return factor_df
@@ -691,7 +645,7 @@ class SurgeFactor:
             pl.lit(factor_name).alias("factor_name")
         )
         
-        # 【修复】整理输出列顺序
+        # 整理输出列顺序
         factor_df = self._format_output(factor_df)
         
         print(f"\n{'='*60}")
@@ -761,13 +715,7 @@ class SurgeFactor:
         
         parts.append(f"t{self.threshold}")
         parts.append(self.intraday_stat)
-        
-        if self.is_abs:
-            parts.insert(0, "abs")
-        
-        if not self.neutralize:
-            parts.append("raw")
-        
+
         factor_name = "_".join(parts)
         
         return factor_name
@@ -812,7 +760,7 @@ class SurgeFactor:
             pl.lit(factor_name).alias("factor_name")
         )
         
-        # 【修复】整理输出格式
+        # 整理输出格式
         factor_df = self._format_output(factor_df)
         
         return factor_df
